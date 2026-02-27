@@ -1,0 +1,398 @@
+--==================================================
+-- Services
+--==================================================
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+
+--==================================================
+-- References
+--==================================================
+local Model        = Workspace:WaitForChild("Model1")
+local Board        = Model.TableVisuals:WaitForChild("Board")
+local Assets       = Model:WaitForChild("MainAssets")
+local Interactions = Model:WaitForChild("Interactions")
+local Config       = Model:WaitForChild("Configuration")
+
+local Ball     = Assets:WaitForChild("Ball")
+local PaddleA  = Assets:WaitForChild("PaddleA")
+local PaddleB  = Assets:WaitForChild("PaddleB")
+
+local GuiA = Interactions.SideA.SurfaceGui
+local GuiB = Interactions.SideB.SurfaceGui
+
+local AutoAButton = GuiA.Frame.Auto
+local AutoBButton = GuiB.Frame.Auto
+local UpA   = GuiA.Frame.Right
+local DownA = GuiA.Frame.Left
+local UpB   = GuiB.Frame.Right
+local DownB = GuiB.Frame.Left
+
+local ScoreBoard = Interactions.Scoreboard.SurfaceGui
+local ScoreA = ScoreBoard.Frame.ScoreA
+local ScoreB = ScoreBoard.Frame.ScoreB
+
+--==================================================
+-- Configuration (Live Loaded)
+--==================================================
+local function GetAttr(name)
+	return Config:GetAttribute(name)
+end
+
+local BALL_SPEED_X
+local BALL_SPEED_Y
+local PADDLE_SPEED
+local FIXED_DT
+local MANUAL_STEP
+local autoA
+local autoB
+
+local function LoadConfig()
+	BALL_SPEED_X = GetAttr("BallSpeedX")
+	BALL_SPEED_Y = GetAttr("BallSpeedY")
+	PADDLE_SPEED = GetAttr("PaddleSpeed")
+	FIXED_DT     = GetAttr("FixedDT")
+	MANUAL_STEP  = GetAttr("ManualStep")
+	autoA        = GetAttr("AutoAEnabled")
+	autoB        = GetAttr("AutoBEnabled")
+end
+
+LoadConfig()
+
+--==================================================
+-- Simulation State
+--==================================================
+local simBallPos = Vector2.new(0.5, 0.5)
+local simBallVel = Vector2.new(BALL_SPEED_X, BALL_SPEED_Y)
+
+local simPaddleAY = 0.5
+local simPaddleBY = 0.5
+
+--==================================================
+-- Scoring
+--==================================================
+local scoreA, scoreB = 0, 0
+local function UpdateScoreUI()
+	ScoreA.Text = tostring(scoreA)
+	ScoreB.Text = tostring(scoreB)
+end
+UpdateScoreUI()
+
+--==================================================
+-- Geometry
+--==================================================
+local boardSize = Board.Size
+
+local ballRadiusStuds = math.max(Ball.Size.Y, Ball.Size.Z) / 2
+local ballRadiusNormX = ballRadiusStuds / boardSize.Z
+local ballRadiusNormY = ballRadiusStuds / boardSize.X
+
+local paddleHalfHeightA = (PaddleA.Size.X / 2) / boardSize.X
+local paddleHalfHeightB = (PaddleB.Size.X / 2) / boardSize.X
+local paddleHalfDepthA  = (PaddleA.Size.Z / 2) / boardSize.Z
+local paddleHalfDepthB  = (PaddleB.Size.Z / 2) / boardSize.Z
+
+local BALL_MIN_X = ballRadiusNormX
+local BALL_MAX_X = 1 - ballRadiusNormX
+local BALL_MIN_Y = ballRadiusNormY
+local BALL_MAX_Y = 1 - ballRadiusNormY
+
+local PADDLE_MIN_Y_A = paddleHalfHeightA
+local PADDLE_MAX_Y_A = 1 - paddleHalfHeightA
+local PADDLE_MIN_Y_B = paddleHalfHeightB
+local PADDLE_MAX_Y_B = 1 - paddleHalfHeightB
+
+local PADDLE_X_A = paddleHalfDepthA
+local PADDLE_X_B = 1 - paddleHalfDepthB
+
+--==================================================
+-- Logging
+--==================================================
+local MAX_RALLY_HITS = 50
+local rallyStartTime = os.clock()
+
+local Logs = {
+	A = { hits = 0, misses = 0, errors = {}, reactions = {} },
+	B = { hits = 0, misses = 0, errors = {}, reactions = {} }
+}
+
+local function Average(tbl)
+	if #tbl == 0 then return 0 end
+	local sum = 0
+	for _,v in ipairs(tbl) do sum += v end
+	return sum / #tbl
+end
+
+local function PrintRallyLog(reason)
+	local duration = os.clock() - rallyStartTime
+
+	print("========== RALLY END ==========")
+	print("Reason:", reason)
+	print("Duration:", duration)
+
+	print("BallSpeedX:", BALL_SPEED_X)
+	print("BallSpeedY:", BALL_SPEED_Y)
+	print("PaddleSpeed:", PADDLE_SPEED)
+	print("FixedDT:", FIXED_DT)
+	print("AutoA:", autoA)
+	print("AutoB:", autoB)
+	print("")
+
+	local function PrintSide(name, data, isAuto)
+		print("Paddle "..name.." ("..(isAuto and "AUTO" or "MANUAL")..")")
+		print("Hits:", data.hits)
+		print("Misses:", data.misses)
+
+		if isAuto then
+			print("AvgPredictionError:", Average(data.errors))
+			print("AvgReactionTime:", Average(data.reactions))
+		else
+			print("AvgPredictionError: MANUAL")
+			print("AvgReactionTime: MANUAL")
+		end
+		print("")
+	end
+
+	PrintSide("A", Logs.A, autoA)
+	PrintSide("B", Logs.B, autoB)
+
+	print("================================")
+end
+
+local function ResetLogs()
+	Logs.A = { hits = 0, misses = 0, errors = {}, reactions = {} }
+	Logs.B = { hits = 0, misses = 0, errors = {}, reactions = {} }
+	rallyStartTime = os.clock()
+end
+
+local function ResetBall()
+	simBallPos = Vector2.new(0.5, 0.5)
+	simBallVel = Vector2.new(BALL_SPEED_X, BALL_SPEED_Y)
+end
+
+--==================================================
+-- Prediction
+--==================================================
+local function PredictInterceptY(targetX)
+	if simBallVel.X == 0 then return simBallPos.Y end
+	local t = (targetX - simBallPos.X) / simBallVel.X
+	if t < 0 then return simBallPos.Y end
+
+	return math.clamp(
+		simBallPos.Y + simBallVel.Y * t,
+		BALL_MIN_Y,
+		BALL_MAX_Y
+	)
+end
+
+--==================================================
+-- Reaction Tracking
+--==================================================
+local lastDir = math.sign(simBallVel.X)
+local waitingReactionA = false
+local waitingReactionB = false
+local dirChangeTime = os.clock()
+
+--==================================================
+-- Ball Simulation
+--==================================================
+local function StepBall(dt)
+	simBallPos += simBallVel * dt
+
+	-- Wall bounce
+	if simBallPos.Y >= BALL_MAX_Y then
+		simBallPos = Vector2.new(simBallPos.X, BALL_MAX_Y)
+		simBallVel = Vector2.new(simBallVel.X, -simBallVel.Y)
+	elseif simBallPos.Y <= BALL_MIN_Y then
+		simBallPos = Vector2.new(simBallPos.X, BALL_MIN_Y)
+		simBallVel = Vector2.new(simBallVel.X, -simBallVel.Y)
+	end
+
+	local currentDir = math.sign(simBallVel.X)
+	if currentDir ~= lastDir then
+		lastDir = currentDir
+		dirChangeTime = os.clock()
+		waitingReactionA = true
+		waitingReactionB = true
+	end
+
+	-- Paddle A collision
+	if simBallVel.X < 0 and
+		math.abs(simBallPos.X - PADDLE_X_A) <= ballRadiusNormX + paddleHalfDepthA and
+		math.abs(simBallPos.Y - simPaddleAY) <= ballRadiusNormY + paddleHalfHeightA then
+
+		Logs.A.hits += 1
+
+		if autoA then
+			local predicted = PredictInterceptY(PADDLE_X_A)
+			table.insert(Logs.A.errors, math.abs(predicted - simBallPos.Y))
+		end
+
+		simBallVel = Vector2.new(-simBallVel.X, simBallVel.Y)
+	end
+
+	-- Paddle B collision
+	if simBallVel.X > 0 and
+		math.abs(simBallPos.X - PADDLE_X_B) <= ballRadiusNormX + paddleHalfDepthB and
+		math.abs(simBallPos.Y - simPaddleBY) <= ballRadiusNormY + paddleHalfHeightB then
+
+		Logs.B.hits += 1
+
+		if autoB then
+			local predicted = PredictInterceptY(PADDLE_X_B)
+			table.insert(Logs.B.errors, math.abs(predicted - simBallPos.Y))
+		end
+
+		simBallVel = Vector2.new(-simBallVel.X, simBallVel.Y)
+	end
+
+	-- Scoring
+	if simBallPos.X < BALL_MIN_X then
+		Logs.A.misses += 1
+		scoreB += 1
+		UpdateScoreUI()
+		PrintRallyLog("MISS A")
+		ResetLogs()
+		ResetBall()
+
+	elseif simBallPos.X > BALL_MAX_X then
+		Logs.B.misses += 1
+		scoreA += 1
+		UpdateScoreUI()
+		PrintRallyLog("MISS B")
+		ResetLogs()
+		ResetBall()
+	end
+
+	-- Rally limit
+	if Logs.A.hits + Logs.B.hits >= MAX_RALLY_HITS then
+		scoreA += 1
+		scoreB += 1
+		UpdateScoreUI()
+		PrintRallyLog("RALLY LIMIT")
+		ResetLogs()
+		ResetBall()
+	end
+end
+
+--==================================================
+-- Paddle Simulation
+--==================================================
+local function StepPaddles(dt)
+	local beforeA = simPaddleAY
+	local beforeB = simPaddleBY
+
+	if autoA then
+		local target = PredictInterceptY(PADDLE_X_A)
+		simPaddleAY += math.clamp(target - simPaddleAY, -PADDLE_SPEED * dt, PADDLE_SPEED * dt)
+	end
+
+	if autoB then
+		local target = PredictInterceptY(PADDLE_X_B)
+		simPaddleBY += math.clamp(target - simPaddleBY, -PADDLE_SPEED * dt, PADDLE_SPEED * dt)
+	end
+
+	if waitingReactionA and beforeA ~= simPaddleAY then
+		table.insert(Logs.A.reactions, os.clock() - dirChangeTime)
+		waitingReactionA = false
+	end
+
+	if waitingReactionB and beforeB ~= simPaddleBY then
+		table.insert(Logs.B.reactions, os.clock() - dirChangeTime)
+		waitingReactionB = false
+	end
+
+	simPaddleAY = math.clamp(simPaddleAY, PADDLE_MIN_Y_A, PADDLE_MAX_Y_A)
+	simPaddleBY = math.clamp(simPaddleBY, PADDLE_MIN_Y_B, PADDLE_MAX_Y_B)
+end
+
+--==================================================
+-- AUTO BUTTON LOGIC
+--==================================================
+local function UpdateAutoButtons()
+	AutoAButton.BackgroundColor3 = autoA and Color3.fromRGB(0,200,0) or Color3.fromRGB(200,0,0)
+	AutoBButton.BackgroundColor3 = autoB and Color3.fromRGB(0,200,0) or Color3.fromRGB(200,0,0)
+end
+
+UpdateAutoButtons()
+
+AutoAButton.MouseButton1Click:Connect(function()
+	Config:SetAttribute("AutoAEnabled", not autoA)
+end)
+
+AutoBButton.MouseButton1Click:Connect(function()
+	Config:SetAttribute("AutoBEnabled", not autoB)
+end)
+
+--==================================================
+-- MANUAL MOVEMENT BUTTONS
+--==================================================
+
+UpA.MouseButton1Click:Connect(function()
+	if not autoA then
+		simPaddleAY += MANUAL_STEP
+		simPaddleAY = math.clamp(simPaddleAY, PADDLE_MIN_Y_A, PADDLE_MAX_Y_A)
+	end
+end)
+
+DownA.MouseButton1Click:Connect(function()
+	if not autoA then
+		simPaddleAY -= MANUAL_STEP
+		simPaddleAY = math.clamp(simPaddleAY, PADDLE_MIN_Y_A, PADDLE_MAX_Y_A)
+	end
+end)
+
+UpB.MouseButton1Click:Connect(function()
+	if not autoB then
+		simPaddleBY -= MANUAL_STEP
+		simPaddleBY = math.clamp(simPaddleBY, PADDLE_MIN_Y_B, PADDLE_MAX_Y_B)
+	end
+end)
+
+DownB.MouseButton1Click:Connect(function()
+	if not autoB then
+		simPaddleBY += MANUAL_STEP
+		simPaddleBY = math.clamp(simPaddleBY, PADDLE_MIN_Y_B, PADDLE_MAX_Y_B)
+	end
+end)
+
+--==================================================
+-- Live Config Change Detection
+--==================================================
+Config.AttributeChanged:Connect(function()
+	LoadConfig()
+	UpdateAutoButtons()
+	PrintRallyLog("CONFIG CHANGE")
+	ResetLogs()
+	ResetBall()
+end)
+
+--==================================================
+-- Render
+--==================================================
+local function SimToWorld(simX, simY)
+	local offset =
+		Board.CFrame.RightVector * ((simY - 0.5) * boardSize.X) +
+		Board.CFrame.LookVector  * ((simX - 0.5) * boardSize.Z)
+	return Board.Position + offset
+end
+
+local function Render()
+	Ball.Position    = SimToWorld(simBallPos.X, simBallPos.Y)
+	PaddleA.Position = SimToWorld(PADDLE_X_A, simPaddleAY)
+	PaddleB.Position = SimToWorld(PADDLE_X_B, simPaddleBY)
+end
+
+--==================================================
+-- Main Loop
+--==================================================
+local accumulator = 0
+
+RunService.Heartbeat:Connect(function(dt)
+	accumulator += dt
+	while accumulator >= FIXED_DT do
+		accumulator -= FIXED_DT
+		StepBall(FIXED_DT)
+		StepPaddles(FIXED_DT)
+	end
+	Render()
+end)
