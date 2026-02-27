@@ -1,0 +1,326 @@
+--==================================================
+-- SERVICES
+--==================================================
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--==================================================
+-- REFERENCES
+--==================================================
+local Model = Workspace:WaitForChild("Model3")
+local Board = Model.TableVisuals:WaitForChild("Board")
+local Assets = Model:WaitForChild("MainAssets")
+local Interactions = Model:WaitForChild("Interactions")
+local Config = Model:WaitForChild("Configuration")
+
+local Ball = Assets:WaitForChild("Ball")
+local PaddleA = Assets:WaitForChild("PaddleA")
+local PaddleB = Assets:WaitForChild("PaddleB")
+
+local ScoreGui = Interactions.Scoreboard.SurfaceGui
+local ScoreA = ScoreGui.Frame.ScoreA
+local ScoreB = ScoreGui.Frame.ScoreB
+
+local PaddleAPrompt = PaddleA:WaitForChild("ProximityPrompt")
+local PaddleBPrompt = PaddleB:WaitForChild("ProximityPrompt")
+
+local EventsFolder = ReplicatedStorage:WaitForChild("Model3_Events")
+local PaddleInputEvent = EventsFolder:WaitForChild("PaddleInput")
+local CorrectionEvent = EventsFolder:WaitForChild("CorrectionEvent")
+
+--==================================================
+-- CONFIG
+--==================================================
+local BALL_SPEED_X, BALL_SPEED_Y
+local PADDLE_SPEED
+local FIXED_DT
+local MAX_RALLY_HITS
+
+local function LoadConfig()
+	BALL_SPEED_X = Config:GetAttribute("BallSpeedX")
+	BALL_SPEED_Y = Config:GetAttribute("BallSpeedY")
+	PADDLE_SPEED = Config:GetAttribute("PaddleSpeed")
+	FIXED_DT = Config:GetAttribute("FixedDT")
+	MAX_RALLY_HITS = Config:GetAttribute("MaxRallyHits") or 50
+end
+
+LoadConfig()
+
+--==================================================
+-- STATE
+--==================================================
+local simBallPos = Vector2.new(0.5,0.5)
+local simBallVel = Vector2.zero
+local simPaddleAY = 0.5
+local simPaddleBY = 0.5
+local paddleAVel = 0
+local paddleBVel = 0
+
+local scoreA, scoreB = 0,0
+local rallyHits = 0
+local rallyStartTime = os.clock()
+
+local Logs = {
+	A={hits=0,misses=0,errors={},reactions={},corrections={}},
+	B={hits=0,misses=0,errors={},reactions={},corrections={}}
+}
+
+--==================================================
+-- LOGGING
+--==================================================
+local function Average(tbl)
+	if #tbl == 0 then return 0 end
+	local s=0
+	for _,v in ipairs(tbl) do s+=v end
+	return s/#tbl
+end
+
+local function ResetLogs()
+	Logs = {
+		A={hits=0,misses=0,errors={},reactions={},corrections={}},
+		B={hits=0,misses=0,errors={},reactions={},corrections={}}
+	}
+	rallyHits = 0
+	rallyStartTime = os.clock()
+end
+
+local function UpdateScore()
+	ScoreA.Text = tostring(scoreA)
+	ScoreB.Text = tostring(scoreB)
+end
+
+local function PrintRallyLog(reason)
+
+	print("========== MODEL 3 RALLY END ==========")
+	print("Reason:", reason)
+	print("Duration:", os.clock()-rallyStartTime)
+	print("BallSpeedX:", BALL_SPEED_X)
+	print("BallSpeedY:", BALL_SPEED_Y)
+	print("PaddleSpeed:", PADDLE_SPEED)
+	print("FixedDT:", FIXED_DT)
+	print("")
+
+	for _,side in ipairs({"A","B"}) do
+		print("Paddle "..side)
+		print("Hits:", Logs[side].hits)
+		print("Misses:", Logs[side].misses)
+		print("Avg Prediction Error:", Average(Logs[side].errors))
+		print("Avg Reaction Time:", Average(Logs[side].reactions))
+		print("Avg Correction Magnitude:", Average(Logs[side].corrections))
+		print("Correction Count:", #Logs[side].corrections)
+		print("")
+	end
+
+	print("========================================")
+end
+
+CorrectionEvent.OnServerEvent:Connect(function(player,side,magnitude)
+	if Logs[side] then
+		table.insert(Logs[side].corrections,magnitude)
+	end
+end)
+
+--==================================================
+-- OWNERSHIP
+--==================================================
+local PaddleOwners={A=nil,B=nil}
+local MatchStarted=false
+
+local function ResetBall()
+	simBallPos=Vector2.new(0.5,0.5)
+	simBallVel=Vector2.new(BALL_SPEED_X,BALL_SPEED_Y)
+	rallyHits=0
+end
+
+local function TryStartMatch()
+	if PaddleOwners.A and PaddleOwners.B and not MatchStarted then
+		MatchStarted=true
+		ResetBall()
+	end
+end
+
+PaddleAPrompt.Triggered:Connect(function(player)
+	if not PaddleOwners.A then
+		PaddleOwners.A=player
+		player:SetAttribute("PaddleSide_Model3","A")
+		PaddleAPrompt.Enabled=false
+		TryStartMatch()
+	end
+end)
+
+PaddleBPrompt.Triggered:Connect(function(player)
+	if not PaddleOwners.B then
+		PaddleOwners.B=player
+		player:SetAttribute("PaddleSide_Model3","B")
+		PaddleBPrompt.Enabled=false
+		TryStartMatch()
+	end
+end)
+
+--==================================================
+-- INPUT
+--==================================================
+PaddleInputEvent.OnServerEvent:Connect(function(player,side,dir)
+
+	-- For testing: allow single client to control both paddles
+	if side=="A" then
+		paddleAVel=dir
+	elseif side=="B" then
+		paddleBVel=dir
+	end
+
+end)
+
+--==================================================
+-- GEOMETRY
+--==================================================
+local boardSize=Board.Size
+local ballRadius=(Ball.Size.Z/2)/boardSize.Z
+local paddleHalfA=(PaddleA.Size.X/2)/boardSize.X
+local paddleHalfB=(PaddleB.Size.X/2)/boardSize.X
+local paddleDepthA=(PaddleA.Size.Z/2)/boardSize.Z
+local paddleDepthB=(PaddleB.Size.Z/2)/boardSize.Z
+
+local BALL_MIN_X=ballRadius
+local BALL_MAX_X=1-ballRadius
+local BALL_MIN_Y=ballRadius
+local BALL_MAX_Y=1-ballRadius
+local PADDLE_X_A=paddleDepthA
+local PADDLE_X_B=1-paddleDepthB
+
+local lastDir=1
+local dirChangeTime=os.clock()
+local waitA=false
+local waitB=false
+
+local function PredictIntercept(targetX)
+	if simBallVel.X==0 then return simBallPos.Y end
+	local t=(targetX-simBallPos.X)/simBallVel.X
+	if t<0 then return simBallPos.Y end
+	return simBallPos.Y+simBallVel.Y*t
+end
+
+--==================================================
+-- SIMULATION
+--==================================================
+local function StepBall(dt)
+
+	simBallPos+=simBallVel*dt
+
+	if simBallPos.Y>=BALL_MAX_Y then
+		simBallPos=Vector2.new(simBallPos.X,BALL_MAX_Y)
+		simBallVel=Vector2.new(simBallVel.X,-simBallVel.Y)
+	elseif simBallPos.Y<=BALL_MIN_Y then
+		simBallPos=Vector2.new(simBallPos.X,BALL_MIN_Y)
+		simBallVel=Vector2.new(simBallVel.X,-simBallVel.Y)
+	end
+
+	local currentDir=math.sign(simBallVel.X)
+	if currentDir~=lastDir then
+		lastDir=currentDir
+		dirChangeTime=os.clock()
+		waitA=true
+		waitB=true
+	end
+
+	if simBallVel.X<0 and
+		math.abs(simBallPos.X-PADDLE_X_A)<=ballRadius+paddleDepthA and
+		math.abs(simBallPos.Y-simPaddleAY)<=paddleHalfA then
+
+		Logs.A.hits+=1
+		table.insert(Logs.A.errors,math.abs(PredictIntercept(PADDLE_X_A)-simBallPos.Y))
+		simBallVel=Vector2.new(-simBallVel.X,simBallVel.Y)
+		rallyHits+=1
+	end
+
+	if simBallVel.X>0 and
+		math.abs(simBallPos.X-PADDLE_X_B)<=ballRadius+paddleDepthB and
+		math.abs(simBallPos.Y-simPaddleBY)<=paddleHalfB then
+
+		Logs.B.hits+=1
+		table.insert(Logs.B.errors,math.abs(PredictIntercept(PADDLE_X_B)-simBallPos.Y))
+		simBallVel=Vector2.new(-simBallVel.X,simBallVel.Y)
+		rallyHits+=1
+	end
+
+	if simBallPos.X<BALL_MIN_X then
+		Logs.A.misses+=1
+		scoreB+=1
+		UpdateScore()
+		PrintRallyLog("MISS A")
+		ResetLogs()
+		ResetBall()
+	elseif simBallPos.X>BALL_MAX_X then
+		Logs.B.misses+=1
+		scoreA+=1
+		UpdateScore()
+		PrintRallyLog("MISS B")
+		ResetLogs()
+		ResetBall()
+	end
+
+	if rallyHits>=MAX_RALLY_HITS then
+		PrintRallyLog("RALLY LIMIT")
+		ResetLogs()
+		ResetBall()
+	end
+end
+
+local function StepPaddles(dt)
+
+	local beforeA=simPaddleAY
+	local beforeB=simPaddleBY
+
+	simPaddleAY+=paddleAVel*PADDLE_SPEED*dt
+	simPaddleBY+=paddleBVel*PADDLE_SPEED*dt
+
+	simPaddleAY=math.clamp(simPaddleAY,paddleHalfA,1-paddleHalfA)
+	simPaddleBY=math.clamp(simPaddleBY,paddleHalfB,1-paddleHalfB)
+
+	if waitA and beforeA~=simPaddleAY then
+		table.insert(Logs.A.reactions,os.clock()-dirChangeTime)
+		waitA=false
+	end
+	if waitB and beforeB~=simPaddleBY then
+		table.insert(Logs.B.reactions,os.clock()-dirChangeTime)
+		waitB=false
+	end
+end
+
+local function SimToWorld(x,y)
+	local offset=
+		Board.CFrame.RightVector*((y-0.5)*boardSize.X)+
+		Board.CFrame.LookVector*((x-0.5)*boardSize.Z)
+	return Board.Position+offset
+end
+
+local function Render()
+	Ball.Position=SimToWorld(simBallPos.X,simBallPos.Y)
+	PaddleA.Position=SimToWorld(PADDLE_X_A,simPaddleAY)
+	PaddleB.Position=SimToWorld(PADDLE_X_B,simPaddleBY)
+end
+
+--==================================================
+-- CONFIG RELOAD
+--==================================================
+Config.AttributeChanged:Connect(function()
+	LoadConfig()
+	ResetLogs()
+	ResetBall()
+end)
+
+--==================================================
+-- MAIN LOOP
+--==================================================
+local accumulator=0
+RunService.Heartbeat:Connect(function(dt)
+	if not MatchStarted then return end
+	accumulator+=dt
+	while accumulator>=FIXED_DT do
+		accumulator-=FIXED_DT
+		StepBall(FIXED_DT)
+		StepPaddles(FIXED_DT)
+	end
+	Render()
+end)
