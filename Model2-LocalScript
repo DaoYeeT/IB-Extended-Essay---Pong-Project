@@ -1,0 +1,206 @@
+--==================================================
+-- SERVICES
+--==================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+--==================================================
+-- REFERENCES
+--==================================================
+local Model = workspace:WaitForChild("Model2")
+local Assets = Model:WaitForChild("MainAssets")
+local Interactions = Model:WaitForChild("Interactions")
+local Config = Model:WaitForChild("Configuration")
+
+local Ball = Assets:WaitForChild("Ball")
+local PaddleA = Assets:WaitForChild("PaddleA")
+local PaddleB = Assets:WaitForChild("PaddleB")
+local Board = Model.TableVisuals:WaitForChild("Board")
+
+local GuiA = Interactions.SideA.SurfaceGui
+local GuiB = Interactions.SideB.SurfaceGui
+
+local AutoAButton = GuiA.Frame.Auto
+local AutoBButton = GuiB.Frame.Auto
+
+local UpA = GuiA.Frame.Right
+local DownA = GuiA.Frame.Left
+local UpB = GuiB.Frame.Right
+local DownB = GuiB.Frame.Left
+
+local EventsFolder = ReplicatedStorage:WaitForChild("Model2_Events")
+local PaddleInputEvent = EventsFolder:WaitForChild("PaddleInput")
+
+--==================================================
+-- OWNERSHIP
+--==================================================
+local ownsA = false
+local ownsB = false
+
+local function UpdateOwnership()
+	local side = player:GetAttribute("PaddleSide_Model2")
+	if side == "A" then ownsA = true end
+	if side == "B" then ownsB = true end
+end
+
+player:GetAttributeChangedSignal("PaddleSide_Model2"):Connect(UpdateOwnership)
+UpdateOwnership()
+
+--==================================================
+-- CONFIG (AUTO TOGGLE)
+--==================================================
+local autoA = Config:GetAttribute("AutoAEnabled")
+local autoB = Config:GetAttribute("AutoBEnabled")
+
+local function UpdateAutoButtons()
+	AutoAButton.BackgroundColor3 = autoA and Color3.fromRGB(0,200,0) or Color3.fromRGB(200,0,0)
+	AutoBButton.BackgroundColor3 = autoB and Color3.fromRGB(0,200,0) or Color3.fromRGB(200,0,0)
+end
+
+UpdateAutoButtons()
+
+AutoAButton.MouseButton1Click:Connect(function()
+	if ownsA then
+		Config:SetAttribute("AutoAEnabled", not autoA)
+	end
+end)
+
+AutoBButton.MouseButton1Click:Connect(function()
+	if ownsB then
+		Config:SetAttribute("AutoBEnabled", not autoB)
+	end
+end)
+
+Config.AttributeChanged:Connect(function(attr)
+	if attr == "AutoAEnabled" then
+		autoA = Config:GetAttribute("AutoAEnabled")
+	elseif attr == "AutoBEnabled" then
+		autoB = Config:GetAttribute("AutoBEnabled")
+	end
+	UpdateAutoButtons()
+end)
+
+--==================================================
+-- UTILITY
+--==================================================
+local boardSize = Board.Size
+
+local function WorldToSim(worldPos)
+	local relative = worldPos - Board.Position
+	local simY = (relative:Dot(Board.CFrame.RightVector) / boardSize.X) + 0.5
+	local simX = (relative:Dot(Board.CFrame.LookVector) / boardSize.Z) + 0.5
+	return Vector2.new(simX, simY)
+end
+
+local function PredictIntercept(ballPos, ballVel, targetX)
+	if ballVel.X == 0 then return ballPos.Y end
+	local t = (targetX - ballPos.X) / ballVel.X
+	if t < 0 then return ballPos.Y end
+	return ballPos.Y + ballVel.Y * t
+end
+
+--==================================================
+-- NETWORK SEND
+--==================================================
+local function sendDirection(side, dir)
+	PaddleInputEvent:FireServer(side, dir)
+end
+
+--==================================================
+-- MANUAL CONTROLS
+--==================================================
+UpA.MouseButton1Down:Connect(function()
+	if ownsA and not autoA then sendDirection("A", 1) end
+end)
+
+UpA.MouseButton1Up:Connect(function()
+	if ownsA and not autoA then sendDirection("A", 0) end
+end)
+
+DownA.MouseButton1Down:Connect(function()
+	if ownsA and not autoA then sendDirection("A", -1) end
+end)
+
+DownA.MouseButton1Up:Connect(function()
+	if ownsA and not autoA then sendDirection("A", 0) end
+end)
+
+UpB.MouseButton1Down:Connect(function()
+	if ownsB and not autoB then sendDirection("B", -1) end
+end)
+
+UpB.MouseButton1Up:Connect(function()
+	if ownsB and not autoB then sendDirection("B", 0) end
+end)
+
+DownB.MouseButton1Down:Connect(function()
+	if ownsB and not autoB then sendDirection("B", 1) end
+end)
+
+DownB.MouseButton1Up:Connect(function()
+	if ownsB and not autoB then sendDirection("B", 0) end
+end)
+
+--==================================================
+-- AI SYSTEM
+--==================================================
+local lastBallPos = nil
+
+local lastDirA = 0
+local lastDirB = 0
+
+RunService.RenderStepped:Connect(function()
+
+	local ballSim = WorldToSim(Ball.Position)
+
+	local function processSide(side, paddlePart, autoEnabled)
+
+		if not autoEnabled then return end
+
+		local isOnMyHalf =
+			(side == "A" and ballSim.X < 0.5) or
+			(side == "B" and ballSim.X > 0.5)
+
+		local targetY
+
+		if isOnMyHalf then
+			-- Simple linear prediction using last known velocity
+			if lastBallPos then
+				local vel = ballSim - lastBallPos
+				local t = ((side=="A" and 0 or 1) - ballSim.X)
+				if vel.X ~= 0 then
+					t = t / vel.X
+					if t > 0 then
+						targetY = ballSim.Y + vel.Y * t
+					else
+						targetY = 0.5
+					end
+				else
+					targetY = ballSim.Y
+				end
+			else
+				targetY = ballSim.Y
+			end
+		else
+			targetY = 0.5
+		end
+
+		local paddleSim = WorldToSim(paddlePart.Position)
+		local diff = targetY - paddleSim.Y
+
+		local dir = 0
+		if math.abs(diff) > 0.03 then
+			dir = diff > 0 and 1 or -1
+		end
+
+		sendDirection(side, dir)
+	end
+
+	processSide("A", PaddleA, ownsA and autoA)
+	processSide("B", PaddleB, ownsB and autoB)
+
+	lastBallPos = ballSim
+end)
