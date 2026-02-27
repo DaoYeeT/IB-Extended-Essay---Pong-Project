@@ -1,0 +1,310 @@
+--==================================================
+-- SERVICES
+--==================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+--==================================================
+-- REFERENCES
+--==================================================
+local Model = workspace:WaitForChild("Model3")
+local Assets = Model:WaitForChild("MainAssets")
+local Interactions = Model:WaitForChild("Interactions")
+local Config = Model:WaitForChild("Configuration")
+
+local Ball = Assets:WaitForChild("Ball")
+local PaddleA = Assets:WaitForChild("PaddleA")
+local PaddleB = Assets:WaitForChild("PaddleB")
+local Board = Model.TableVisuals:WaitForChild("Board")
+
+local GuiA = Interactions.SideA.SurfaceGui
+local GuiB = Interactions.SideB.SurfaceGui
+
+local AutoAButton = GuiA.Frame.Auto
+local AutoBButton = GuiB.Frame.Auto
+
+local UpA = GuiA.Frame.Right
+local DownA = GuiA.Frame.Left
+local UpB = GuiB.Frame.Right
+local DownB = GuiB.Frame.Left
+
+local EventsFolder = ReplicatedStorage:WaitForChild("Model3_Events")
+local PaddleInputEvent = EventsFolder:WaitForChild("PaddleInput")
+local CorrectionEvent = EventsFolder:WaitForChild("CorrectionEvent")
+
+--==================================================
+-- CONFIG
+--==================================================
+local PADDLE_SPEED = Config:GetAttribute("PaddleSpeed")
+
+Config.AttributeChanged:Connect(function(attr)
+	if attr == "PaddleSpeed" then
+		PADDLE_SPEED = Config:GetAttribute("PaddleSpeed")
+	end
+end)
+
+--==================================================
+-- OWNERSHIP
+--==================================================
+local ownsA = false
+local ownsB = false
+
+local function UpdateOwnership()
+	local side = player:GetAttribute("PaddleSide_Model3")
+
+	-- Allow single client to test both paddles
+	if side == "A" then
+		ownsA = true
+	elseif side == "B" then
+		ownsB = true
+	end
+end
+
+player:GetAttributeChangedSignal("PaddleSide_Model3"):Connect(UpdateOwnership)
+UpdateOwnership()
+
+--==================================================
+-- AUTO TOGGLE
+--==================================================
+local autoA = Config:GetAttribute("AutoAEnabled")
+local autoB = Config:GetAttribute("AutoBEnabled")
+
+local function UpdateAutoButtons()
+	AutoAButton.BackgroundColor3 =
+		autoA and Color3.fromRGB(0,200,0) or Color3.fromRGB(200,0,0)
+
+	AutoBButton.BackgroundColor3 =
+		autoB and Color3.fromRGB(0,200,0) or Color3.fromRGB(200,0,0)
+end
+
+UpdateAutoButtons()
+
+AutoAButton.MouseButton1Click:Connect(function()
+	if ownsA then
+		Config:SetAttribute("AutoAEnabled", not autoA)
+	end
+end)
+
+AutoBButton.MouseButton1Click:Connect(function()
+	if ownsB then
+		Config:SetAttribute("AutoBEnabled", not autoB)
+	end
+end)
+
+Config.AttributeChanged:Connect(function(attr)
+	if attr == "AutoAEnabled" then
+		autoA = Config:GetAttribute("AutoAEnabled")
+	elseif attr == "AutoBEnabled" then
+		autoB = Config:GetAttribute("AutoBEnabled")
+	end
+	UpdateAutoButtons()
+end)
+
+--==================================================
+-- WORLD → SIM CONVERSION
+--==================================================
+local boardSize = Board.Size
+
+local function WorldToSim(worldPos)
+	local relative = worldPos - Board.Position
+	local simY = (relative:Dot(Board.CFrame.RightVector) / boardSize.X) + 0.5
+	local simX = (relative:Dot(Board.CFrame.LookVector) / boardSize.Z) + 0.5
+	return Vector2.new(simX, simY)
+end
+
+local function SimToWorld(x,y)
+	local offset =
+		Board.CFrame.RightVector*((y-0.5)*boardSize.X)+
+		Board.CFrame.LookVector*((x-0.5)*boardSize.Z)
+	return Board.Position+offset
+end
+
+--==================================================
+-- NETWORK SEND
+--==================================================
+local function sendDirection(side,dir)
+	PaddleInputEvent:FireServer(side,dir)
+end
+
+--==================================================
+-- LOCAL PREDICTION STATE
+--==================================================
+local localPaddleAY = 0.5
+local localPaddleBY = 0.5
+
+local dirA = 0
+local dirB = 0
+
+--==================================================
+-- MANUAL INPUT
+--==================================================
+UpA.MouseButton1Down:Connect(function()
+	if ownsA and not autoA then
+		dirA = 1
+		sendDirection("A",1)
+	end
+end)
+
+UpA.MouseButton1Up:Connect(function()
+	if ownsA and not autoA then
+		dirA = 0
+		sendDirection("A",0)
+	end
+end)
+
+DownA.MouseButton1Down:Connect(function()
+	if ownsA and not autoA then
+		dirA = -1
+		sendDirection("A",-1)
+	end
+end)
+
+DownA.MouseButton1Up:Connect(function()
+	if ownsA and not autoA then
+		dirA = 0
+		sendDirection("A",0)
+	end
+end)
+
+UpB.MouseButton1Down:Connect(function()
+	if ownsB and not autoB then
+		dirB = -1
+		sendDirection("B",-1)
+	end
+end)
+
+UpB.MouseButton1Up:Connect(function()
+	if ownsB and not autoB then
+		dirB = 0
+		sendDirection("B",0)
+	end
+end)
+
+DownB.MouseButton1Down:Connect(function()
+	if ownsB and not autoB then
+		dirB = 1
+		sendDirection("B",1)
+	end
+end)
+
+DownB.MouseButton1Up:Connect(function()
+	if ownsB and not autoB then
+		dirB = 0
+		sendDirection("B",0)
+	end
+end)
+
+--==================================================
+-- AI
+--==================================================
+local lastBallPos = nil
+
+local function PredictIntercept(ballPos, ballVel, targetX)
+	if ballVel.X == 0 then return ballPos.Y end
+	local t = (targetX - ballPos.X) / ballVel.X
+	if t < 0 then return 0.5 end
+	return ballPos.Y + ballVel.Y * t
+end
+
+--==================================================
+-- MAIN LOOP
+--==================================================
+RunService.RenderStepped:Connect(function(dt)
+
+	local ballSim = WorldToSim(Ball.Position)
+
+	-- Velocity estimate
+	local vel = Vector2.zero
+	if lastBallPos then
+		vel = ballSim - lastBallPos
+	end
+	lastBallPos = ballSim
+
+	--======================
+	-- AI DECISION
+	--======================
+	local function processAI(side,autoEnabled)
+
+		if not autoEnabled then return end
+
+		local isOnMyHalf =
+			(side=="A" and ballSim.X<0.5) or
+			(side=="B" and ballSim.X>0.5)
+
+		local targetY = 0.5
+
+		if isOnMyHalf then
+			targetY = PredictIntercept(ballSim,vel,side=="A" and 0 or 1)
+		end
+
+		local paddleSim = (side=="A")
+			and Vector2.new(0,localPaddleAY)
+			or Vector2.new(0,localPaddleBY)
+
+		local diff = targetY - paddleSim.Y
+
+		local dir = 0
+		if math.abs(diff) > 0.03 then
+			dir = diff>0 and 1 or -1
+		end
+
+		if side=="A" then
+			dirA = dir
+			sendDirection("A",dir)
+		else
+			dirB = dir
+			sendDirection("B",dir)
+		end
+	end
+
+	processAI("A",ownsA and autoA)
+	processAI("B",ownsB and autoB)
+
+	--======================
+	-- LOCAL PREDICTION
+	--======================
+	if ownsA then
+		localPaddleAY += dirA * PADDLE_SPEED * dt
+	end
+
+	if ownsB then
+		localPaddleBY += dirB * PADDLE_SPEED * dt
+	end
+
+	--======================
+	-- RECONCILIATION
+	--======================
+	if ownsA then
+		local serverY = WorldToSim(PaddleA.Position).Y
+		local diff = math.abs(localPaddleAY - serverY)
+
+		if diff > 0.05 then
+			CorrectionEvent:FireServer("A",diff)
+			localPaddleAY = serverY
+		end
+
+		PaddleA.Position = SimToWorld(
+			WorldToSim(PaddleA.Position).X,
+			localPaddleAY
+		)
+	end
+
+	if ownsB then
+		local serverY = WorldToSim(PaddleB.Position).Y
+		local diff = math.abs(localPaddleBY - serverY)
+
+		if diff > 0.05 then
+			CorrectionEvent:FireServer("B",diff)
+			localPaddleBY = serverY
+		end
+
+		PaddleB.Position = SimToWorld(
+			WorldToSim(PaddleB.Position).X,
+			localPaddleBY
+		)
+	end
+
+end)
